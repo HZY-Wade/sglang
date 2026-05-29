@@ -90,6 +90,26 @@ class HiRadixCache(RadixCache):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
+            # Non-rank-0 MLA ranks use an allocator-only host pool.
+            from sglang.srt.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+            from sglang.srt.layers.dp_attention import (
+                get_attention_tp_rank,
+                get_attention_tp_size,
+                is_dp_attention_enabled,
+            )
+            from sglang.srt.utils import is_cuda
+
+            if is_dp_attention_enabled():
+                mla_tp_rank = get_attention_tp_rank()
+                mla_tp_size = get_attention_tp_size()
+            else:
+                mla_tp_rank = get_tensor_model_parallel_rank()
+                mla_tp_size = get_tensor_model_parallel_world_size()
+            mla_is_dummy = is_cuda() and mla_tp_size > 1 and mla_tp_rank != 0
+
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
@@ -97,6 +117,7 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                is_dummy=mla_is_dummy,
             )
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, and DSA models")
@@ -217,6 +238,10 @@ class HiRadixCache(RadixCache):
                 self.detach_storage_backend()
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")
+        try:
+            self.cache_controller._destroy_mla_broadcast_group()
+        except Exception:
+            logger.exception("Failed to destroy MLA broadcast group.")
 
     def _apply_storage_runtime_config(
         self,

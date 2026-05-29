@@ -865,8 +865,24 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        is_dummy: bool = False,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
+        self._is_dummy = is_dummy
+
+        if is_dummy:
+            self._init_dummy(
+                device_pool,
+                host_to_device_ratio,
+                host_size,
+                page_size,
+                layout,
+                pin_memory,
+                device,
+                allocator_type,
+            )
+            return
+
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -893,6 +909,56 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+
+    def _init_dummy(
+        self,
+        device_pool: MLATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool,
+        device: str,
+        allocator_type: str,
+    ):
+        """Allocator-only init for non-rank-0 MLA ranks: keep free-slot
+        bookkeeping in sync without allocating the host KV buffer."""
+        self.device_pool = device_pool
+        self.page_size = page_size
+        self.layout = layout
+        self.pin_memory = pin_memory
+        self.device = device
+        self.allocator = get_allocator_from_storage(allocator_type)
+
+        self.dtype = device_pool.store_dtype
+        self.size_per_token = self.get_size_per_token()
+
+        if host_size > 0:
+            self.size = int(host_size * 1e9 // self.size_per_token)
+        else:
+            self.size = int(device_pool.size * host_to_device_ratio)
+        self.page_num = self.size // self.page_size + 1
+        self.size = self.page_num * self.page_size
+        self.start_layer = device_pool.start_layer
+        self.end_layer = device_pool.end_layer
+
+        self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
+        self.layout_dim = self.token_stride_size * self.layer_num
+
+        self.can_use_jit = False
+        self.kv_buffer = None
+        self.data_refs = None
+        self.data_ptrs = None
+
+        logger.info(
+            "MLATokenToKVPoolHost dummy mode: allocator-only, size=%d tokens, "
+            "saving %.2f GB host memory",
+            self.size,
+            self.size * self.size_per_token / 1e9,
+        )
+
+        self.lock = threading.RLock()
+        self.clear()
 
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
@@ -991,6 +1057,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        assert not self._is_dummy, "load on a dummy (non-rank-0 MLA) host pool"
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -1074,6 +1141,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        assert not self._is_dummy, "backup on a dummy (non-rank-0 MLA) host pool"
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:

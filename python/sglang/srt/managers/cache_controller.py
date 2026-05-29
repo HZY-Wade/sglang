@@ -40,8 +40,8 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.utils import get_device_module
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MLATokenToKVPool
+from sglang.srt.utils import get_device_module, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +323,27 @@ class HiCacheController:
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
 
+        # MLA KV is identical across TP ranks; rank 0 owns the host copy and
+        # broadcasts loaded GPU pages to the other ranks.
+        self.is_mla = (
+            isinstance(self.mem_pool_device, MLATokenToKVPool)
+            and not isinstance(self.mem_pool_device, DSATokenToKVPool)
+            and is_cuda()
+        )
+        self.mla_bcast_group = None
+        if self.is_mla:
+            if is_dp_attention_enabled():
+                self._mla_tp_rank = get_attention_tp_rank()
+                self._mla_tp_size = get_attention_tp_size()
+            else:
+                self._mla_tp_rank = get_tensor_model_parallel_rank()
+                self._mla_tp_size = get_tensor_model_parallel_world_size()
+            if self._mla_tp_size > 1:
+                self._init_mla_broadcast()
+        else:
+            self._mla_tp_rank = 0
+            self._mla_tp_size = 1
+
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
         if storage_backend is not None:
@@ -336,6 +357,44 @@ class HiCacheController:
             except ValueError as e:
                 # Preserve the historical error shape on init for unknown backends.
                 raise ValueError(f"Failed to create storage backend: {e}") from e
+
+    @property
+    def mla_broadcast_enabled(self) -> bool:
+        return self.is_mla and self.mla_bcast_group is not None
+
+    def _init_mla_broadcast(self) -> None:
+        from sglang.srt.distributed.parallel_state import create_custom_parallel_group
+
+        base_group = self.tp_group
+        if is_dp_attention_enabled() and self.attn_tp_group is not None:
+            base_group = self.attn_tp_group
+        group_ranks = torch.distributed.get_process_group_ranks(base_group)
+
+        # Dedicated NCCL group so the load-time broadcast never interleaves with
+        # the model-forward collectives.
+        self.mla_bcast_group = create_custom_parallel_group(
+            group_ranks=list(group_ranks), backend="nccl"
+        )
+        self._mla_bcast_src = group_ranks[0]
+
+        # Staging buffer coalescing all layers of one token chunk into a single
+        # broadcast; reused across loads and bounded by bt_num_tokens.
+        self._mla_bt_num_tokens = 512
+        self._mla_bt = torch.empty(
+            self.layer_num
+            * self._mla_bt_num_tokens
+            * self.mem_pool_device.kv_cache_dim,
+            dtype=self.mem_pool_device.kv_buffer[0].dtype,
+            device=self.device,
+        )
+
+    def _destroy_mla_broadcast_group(self) -> None:
+        if self.mla_bcast_group is not None:
+            try:
+                torch.distributed.destroy_process_group(self.mla_bcast_group)
+            except Exception:
+                pass
+            self.mla_bcast_group = None
 
     def get_attn_cp_rank_and_size(self) -> tuple[int, int]:
         """Derive CP rank/size from the attn_cp process group."""
@@ -703,13 +762,23 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices = self.move_indices(
-            op.host_indices, op.device_indices
-        )
         self.write_queue.clear()
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
+
+        if self.mla_broadcast_enabled and self._mla_tp_rank != 0:
+            # Non-rank-0 ranks have a dummy host pool: skip D2H, just ack.
+            start_event.record()
+            finish_event.record()
+            self.ack_write_queue.append(
+                HiCacheAck(start_event, finish_event, op.node_ids)
+            )
+            return
+
+        host_indices, device_indices = self.move_indices(
+            op.host_indices, op.device_indices
+        )
 
         start_event.record()
         with device_module.stream(self.write_stream):
@@ -780,10 +849,14 @@ class HiCacheController:
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
+        self.load_queue.clear()
+
+        if self.mla_broadcast_enabled:
+            return self._start_loading_mla(producer_id, op)
+
         host_indices, device_indices = self.move_indices(
             op.host_indices, op.device_indices
         )
-        self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
@@ -823,6 +896,87 @@ class HiCacheController:
         )
         return producer_id
 
+    def _start_loading_mla(self, producer_id: int, op: CacheOperation) -> int:
+        """Load MLA KV on rank 0, then broadcast it to the other TP ranks.
+
+        H2D and broadcast are both enqueued on ``load_stream``: stream ordering
+        guarantees rank 0's H2D lands before the broadcast reads the KV buffer,
+        and the per-layer load events fire when the stream drains, so the normal
+        ``loading_check`` ack path finalizes the load with no extra polling.
+        """
+        producer_event = self.layer_done_counter.events[producer_id]
+        producer_event.start_event.record()
+
+        with device_module.stream(self.load_stream):
+            producer_event.start_event.wait(self.load_stream)
+            if self._mla_tp_rank == 0:
+                host_indices, device_indices = self.move_indices(
+                    op.host_indices, op.device_indices
+                )
+                for i in range(self.layer_num):
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mem_pool_device,
+                        host_indices,
+                        device_indices,
+                        i,
+                        self.io_backend,
+                    )
+                if host_indices.is_cuda:
+                    host_indices.record_stream(self.load_stream)
+                if device_indices.is_cuda:
+                    device_indices.record_stream(self.load_stream)
+
+            self._broadcast_mla_kv(op.device_indices)
+            for i in range(self.layer_num):
+                producer_event.complete(i)
+
+        self.ack_load_queue.append(
+            HiCacheAck(
+                start_event=producer_event.start_event,
+                finish_event=producer_event.finish_event,
+                node_ids=op.node_ids,
+            )
+        )
+        return producer_id
+
+    def _broadcast_mla_kv(self, device_indices: torch.Tensor) -> None:
+        """Broadcast loaded KV pages from rank 0 to the other TP ranks.
+
+        Pages are coalesced layer-by-layer into the reused staging buffer and
+        sent in token chunks, one NCCL broadcast per chunk over the dedicated
+        group. Caller must run this inside the load stream.
+        """
+        indices = device_indices
+        if not indices.is_cuda:
+            indices = indices.to(self.device)
+        kv_buffer = self.mem_pool_device.kv_buffer
+        stride = self.mem_pool_device.kv_cache_dim
+        is_src = self._mla_tp_rank == 0
+        n = indices.shape[0]
+
+        for start in range(0, n, self._mla_bt_num_tokens):
+            cur = min(self._mla_bt_num_tokens, n - start)
+            idx = indices[start : start + cur]
+            chunk = self._mla_bt[: self.layer_num * cur * stride]
+
+            if is_src:
+                for layer_id in range(self.layer_num):
+                    o = layer_id * cur * stride
+                    chunk[o : o + cur * stride].copy_(
+                        kv_buffer[layer_id][idx].reshape(-1)
+                    )
+
+            torch.distributed.broadcast(
+                chunk, src=self._mla_bcast_src, group=self.mla_bcast_group
+            )
+
+            if not is_src:
+                for layer_id in range(self.layer_num):
+                    o = layer_id * cur * stride
+                    kv_buffer[layer_id][idx] = chunk[o : o + cur * stride].view(
+                        cur, 1, stride
+                    )
+
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)
         return len(device_indices)
@@ -836,6 +990,12 @@ class HiCacheController:
 
     def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
         """Register draft KV pools so L2/L3 ops piggyback draft transfers."""
+        if self.mla_broadcast_enabled:
+            raise NotImplementedError(
+                "Draft KV pools are not supported together with the MLA host "
+                "memory dedup broadcast. Disable hierarchical cache for the "
+                "draft model or run MLA without TP>1 dedup."
+            )
         self.has_draft = True
         self.mem_pool_device_draft = draft_device_pool
         self.mem_pool_host_draft = draft_host_pool
