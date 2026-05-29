@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 import logging
+import math
 import threading
 import time
 from queue import Empty, Full, Queue
@@ -325,11 +326,10 @@ class HiCacheController:
 
         # MLA KV is identical across TP ranks; rank 0 owns the host copy and
         # broadcasts loaded GPU pages to the other ranks.
-        self.is_mla = (
-            isinstance(self.mem_pool_device, MLATokenToKVPool)
-            and not isinstance(self.mem_pool_device, DSATokenToKVPool)
-            and is_cuda()
-        )
+        self.is_mla = isinstance(self.mem_pool_device, MLATokenToKVPool) and is_cuda()
+        # DSA additionally stores a per-page indexer buffer that must be
+        # broadcast alongside the MLA latent (DSATokenToKVPool subclasses MLA).
+        self.is_dsa = isinstance(self.mem_pool_device, DSATokenToKVPool)
         self.mla_bcast_group = None
         if self.is_mla:
             if is_dp_attention_enabled():
@@ -387,6 +387,16 @@ class HiCacheController:
             dtype=self.mem_pool_device.kv_buffer[0].dtype,
             device=self.device,
         )
+        # DSA also stores a per-page indexer buffer that must be broadcast too.
+        self._mla_idx_bufs = None
+        if self.is_dsa:
+            self._mla_idx_bufs = self.mem_pool_device.index_k_with_scale_buffer
+            self._mla_idx_elem = math.prod(self._mla_idx_bufs[0].shape[1:]) or 1
+            self._mla_idx_bt = torch.empty(
+                self.layer_num * self._mla_bt_num_tokens * self._mla_idx_elem,
+                dtype=self._mla_idx_bufs[0].dtype,
+                device=self.device,
+            )
 
     def _destroy_mla_broadcast_group(self) -> None:
         if self.mla_bcast_group is not None:
@@ -939,43 +949,58 @@ class HiCacheController:
         )
         return producer_id
 
-    def _broadcast_mla_kv(self, device_indices: torch.Tensor) -> None:
-        """Broadcast loaded KV pages from rank 0 to the other TP ranks.
+    def _bcast_buf(self, buf_list, staging, target, elem) -> None:
+        """Broadcast one per-layer buffer set from rank 0, in row chunks.
 
-        Pages are coalesced layer-by-layer into the reused staging buffer and
-        sent in token chunks, one NCCL broadcast per chunk over the dedicated
-        group. Caller must run this inside the load stream.
+        ``target`` indexes dim 0 of each layer tensor (token indices for the KV
+        latent, page indices for the DSA indexer). Must run on load_stream.
+        """
+        is_src = self._mla_tp_rank == 0
+        n = target.shape[0]
+        for start in range(0, n, self._mla_bt_num_tokens):
+            cur = min(self._mla_bt_num_tokens, n - start)
+            idx = target[start : start + cur]
+            chunk = staging[: self.layer_num * cur * elem]
+            if is_src:
+                for layer_id in range(self.layer_num):
+                    o = layer_id * cur * elem
+                    chunk[o : o + cur * elem].copy_(buf_list[layer_id][idx].reshape(-1))
+            torch.distributed.broadcast(
+                chunk, src=self._mla_bcast_src, group=self.mla_bcast_group
+            )
+            if not is_src:
+                for layer_id in range(self.layer_num):
+                    o = layer_id * cur * elem
+                    buf_list[layer_id][idx] = chunk[o : o + cur * elem].view(
+                        buf_list[layer_id][idx].shape
+                    )
+
+    def _broadcast_mla_kv(self, device_indices: torch.Tensor) -> None:
+        """Broadcast loaded KV (and DSA indexer) pages from rank 0 to peers.
+
+        Coalesced layer-by-layer into reused staging buffers and sent in chunks,
+        one NCCL broadcast per chunk over the dedicated group. Must run on the
+        load stream.
         """
         indices = device_indices
         if not indices.is_cuda:
             indices = indices.to(self.device)
-        kv_buffer = self.mem_pool_device.kv_buffer
-        stride = self.mem_pool_device.kv_cache_dim
-        is_src = self._mla_tp_rank == 0
-        n = indices.shape[0]
-
-        for start in range(0, n, self._mla_bt_num_tokens):
-            cur = min(self._mla_bt_num_tokens, n - start)
-            idx = indices[start : start + cur]
-            chunk = self._mla_bt[: self.layer_num * cur * stride]
-
-            if is_src:
-                for layer_id in range(self.layer_num):
-                    o = layer_id * cur * stride
-                    chunk[o : o + cur * stride].copy_(
-                        kv_buffer[layer_id][idx].reshape(-1)
-                    )
-
-            torch.distributed.broadcast(
-                chunk, src=self._mla_bcast_src, group=self.mla_bcast_group
+        self._bcast_buf(
+            self.mem_pool_device.kv_buffer,
+            self._mla_bt,
+            indices,
+            self.mem_pool_device.kv_cache_dim,
+        )
+        if self._mla_idx_bufs is not None:
+            page_size = self.mem_pool_device.page_size
+            page_idx = (
+                torch.unique(torch.div(indices, page_size, rounding_mode="floor"))
+                if page_size > 1
+                else indices
             )
-
-            if not is_src:
-                for layer_id in range(self.layer_num):
-                    o = layer_id * cur * stride
-                    kv_buffer[layer_id][idx] = chunk[o : o + cur * stride].view(
-                        cur, 1, stride
-                    )
+            self._bcast_buf(
+                self._mla_idx_bufs, self._mla_idx_bt, page_idx, self._mla_idx_elem
+            )
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)

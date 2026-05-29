@@ -2691,7 +2691,9 @@ class DSAIndexerPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        is_dummy: bool = False,
     ):
+        self._is_dummy = is_dummy
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = layout
@@ -2721,6 +2723,20 @@ class DSAIndexerPoolHost(HostKVCache):
         self.size_per_token = (
             self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
         )
+
+        if is_dummy:
+            # Non-rank-0 DSA dedup: allocator-only, indexer data arrives via
+            # broadcast at load time, so skip the host buffer allocation.
+            self.index_k_with_scale_buffer = None
+            self.index_k_device_ptrs = None
+            logger.info(
+                "DSAIndexerPoolHost dummy mode: allocator-only, size=%d tokens, "
+                "skipping indexer buffer allocation",
+                self.size,
+            )
+            self.lock = threading.RLock()
+            self.clear()
+            return
 
         buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
         requested_bytes = buf_elem_size * self.indexer_dtype.itemsize

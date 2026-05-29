@@ -395,12 +395,20 @@ class HybridCacheController(BaseHiCacheController):
         if not self.write_queue:
             return
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices, resolved_pool_transfers = (
-            self.move_hybrid_indices(op)
-        )
         self.write_queue.clear()
         start_event = device_module.Event()
         finish_event = device_module.Event()
+        if self.mla_broadcast_enabled and self._mla_tp_rank != 0:
+            # MLA/DSA dedup: non-rank-0 has dummy host pools; skip D2H, just ack.
+            start_event.record()
+            finish_event.record()
+            self.ack_write_queue.append(
+                HiCacheAck(start_event, finish_event, op.node_ids)
+            )
+            return
+        host_indices, device_indices, resolved_pool_transfers = (
+            self.move_hybrid_indices(op)
+        )
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
@@ -468,10 +476,12 @@ class HybridCacheController(BaseHiCacheController):
             return -1
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
+        self.load_queue.clear()
+        if self.mla_broadcast_enabled:
+            return self._start_loading_mla(producer_id, op)
         host_indices, device_indices, resolved_pool_transfers = (
             self.move_hybrid_indices(op)
         )
-        self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
         with device_module.stream(self.load_stream):
@@ -492,6 +502,48 @@ class HybridCacheController(BaseHiCacheController):
                 device_indices,
                 resolved_pool_transfers,
             )
+        self.ack_load_queue.append(
+            HiCacheAck(
+                producer_event.start_event,
+                producer_event.finish_event,
+                op.node_ids,
+            )
+        )
+        return producer_id
+
+    def _start_loading_mla(self, producer_id: int, op: CacheOperation) -> int:
+        """MLA/DSA dedup load: rank 0 does the full H2D (KV latent + DSA indexer
+        via pool transfers), then broadcasts both to the other ranks on
+        load_stream; non-rank-0 ranks skip H2D and only receive the broadcast.
+        The per-layer load events fire when the stream drains, so the normal
+        loading_check ack path finalizes the load.
+        """
+        producer_event = self.layer_done_counter.events[producer_id]
+        producer_event.start_event.record()
+        with device_module.stream(self.load_stream):
+            producer_event.start_event.wait(self.load_stream)
+            if self._mla_tp_rank == 0:
+                host_indices, device_indices, resolved_pool_transfers = (
+                    self.move_hybrid_indices(op)
+                )
+                for i in range(self.layer_num):
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mem_pool_device,
+                        host_indices,
+                        device_indices,
+                        i,
+                        self.io_backend,
+                        pool_transfers=resolved_pool_transfers,
+                    )
+                self._record_transfer_indices_on_stream(
+                    self.load_stream,
+                    host_indices,
+                    device_indices,
+                    resolved_pool_transfers,
+                )
+            self._broadcast_mla_kv(op.device_indices)
+            for i in range(self.layer_num):
+                producer_event.complete(i)
         self.ack_load_queue.append(
             HiCacheAck(
                 producer_event.start_event,
