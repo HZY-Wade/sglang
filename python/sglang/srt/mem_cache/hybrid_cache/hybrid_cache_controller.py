@@ -23,6 +23,9 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
+from sglang.srt.managers.cache_controller import (
+    storage_supports_host_dedup,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
@@ -193,11 +196,37 @@ class HybridCacheController(BaseHiCacheController):
             pp_size=pp_size,
             enable_storage_metrics=enable_storage_metrics,
         )
+        # The base is_mla/broadcast gate ran with storage_backend=None (this
+        # controller attaches storage afterwards), so re-apply the dedup storage
+        # gate with the real startup backend: disable dedup for backends that
+        # cannot tolerate the dummy pool. This matches the assembler's
+        # mla_is_dummy gating so broadcast never runs against full (non-dummy)
+        # pools.
+        if self.mla_broadcast_enabled and not storage_supports_host_dedup(
+            startup_storage_backend
+        ):
+            self._destroy_mla_broadcast_group()
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
         if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
             self.layer_num = transfer_layer_num
             self.layer_done_counter = LayerDoneCounter(self.layer_num)
+            # The MLA host-dedup broadcast only covers the MLA latent KV buffer
+            # and indexes it by self.layer_num. Once the transfer layer count is
+            # expanded to include non-KV pools (e.g. Mamba state in a linear+MLA
+            # hybrid), broadcasting by the expanded count would index the KV
+            # buffer out of bounds and would not replicate the extra state at
+            # all. These hybrid stacks keep full (non-dummy) host pools on every
+            # rank, so disable dedup here and fall back to the normal per-rank
+            # D2H/H2D path.
+            if self.mla_broadcast_enabled:
+                logger.info(
+                    "Disabling MLA host-dedup broadcast: transfer layer count "
+                    "(%d) exceeds the MLA KV layers, so extra hybrid pools "
+                    "(e.g. Mamba) are not deduplicated.",
+                    self.layer_num,
+                )
+                self._destroy_mla_broadcast_group()
 
         if startup_storage_backend is not None:
             self.attach_storage_backend(
@@ -228,6 +257,11 @@ class HybridCacheController(BaseHiCacheController):
         )
 
         for entry in host_pools or []:
+            # A dummy (non-rank-0 dedup) pool has no host buffer to register;
+            # registering it (e.g. Mooncake) would touch a None buffer. Non-
+            # rank-0 never reads L3 anyway, so skip it.
+            if getattr(entry.host_pool, "_is_dummy", False):
+                continue
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     @staticmethod
@@ -541,6 +575,11 @@ class HybridCacheController(BaseHiCacheController):
                     device_indices,
                     resolved_pool_transfers,
                 )
+                # The "direct" io backend may issue H2D off load_stream, so plain
+                # stream ordering is not enough; fully land rank 0's H2D before
+                # the broadcast reads the device KV buffer (mirrors the base
+                # HiCacheController._start_loading_mla).
+                self.load_stream.synchronize()
             self._broadcast_mla_kv(op.device_indices)
             for i in range(self.layer_num):
                 producer_event.complete(i)
@@ -670,6 +709,15 @@ class HybridCacheController(BaseHiCacheController):
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation):
+        # MLA/DSA dedup: non-rank-0 ranks have dummy host pools (KV *and* the
+        # indexer sidecar buffer are None), so they must not read L3 into them;
+        # the data arrives via rank 0's load-time broadcast. Mark the prefetch
+        # complete here. This MUST run before the sidecar batch_get below -- the
+        # base skip in super()._page_transfer is too late and would still write
+        # into the dummy indexer pool.
+        if self.mla_broadcast_enabled and self._mla_tp_rank != 0:
+            operation.completed_tokens += len(operation.hash_value) * self.page_size
+            return
         # Transfer extra pools
         if operation.pool_transfers and not operation.is_terminated():
             self._resolve_sidecar_derived_pool_transfers(operation)

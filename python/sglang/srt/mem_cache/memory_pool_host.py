@@ -2566,6 +2566,20 @@ class HostPoolGroup:
     def size_per_token(self):
         return self.anchor_entry.host_pool.size_per_token
 
+    def get_size_per_token(self):
+        # Some storage-backend factories (e.g. HF3FS) call this as a method on
+        # the host pool; delegate to the anchor pool so a HostPoolGroup works.
+        return self.anchor_entry.host_pool.get_size_per_token()
+
+    def get_ksize_per_token(self):
+        return self.anchor_entry.host_pool.get_ksize_per_token()
+
+    @property
+    def _is_dummy(self):
+        # Surface the anchor (KV) pool's dummy flag so dedup-aware guards
+        # (e.g. skipping register_mem_pool_host) fire for the grouped case too.
+        return getattr(self.anchor_entry.host_pool, "_is_dummy", False)
+
     @property
     def allocator(self):
         return self.anchor_entry.host_pool.allocator

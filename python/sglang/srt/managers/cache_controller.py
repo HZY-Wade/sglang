@@ -53,6 +53,21 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+# Storage backends compatible with MLA/NSA host-memory dedup. The dummy
+# (non-rank-0) host pool has no local KV buffer, so dedup only engages for
+# backends that never construct against / register / read that buffer.
+# "file" (HiCacheFile) is built from config alone and stages via flat copies,
+# so it coexists; the RDMA/registered backends (mooncake/eic/simm/hf3fs/nixl/
+# aibrix) touch the host buffer at construct or register time, so dedup stays
+# off for them and every rank keeps a full host pool (pre-dedup behavior).
+_DEDUP_COMPATIBLE_STORAGE = frozenset({None, "", "file"})
+
+
+def storage_supports_host_dedup(storage_backend) -> bool:
+    """Whether MLA/NSA host-memory dedup can engage with this storage backend."""
+    return storage_backend in _DEDUP_COMPATIBLE_STORAGE
+
+
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
@@ -332,10 +347,15 @@ class HiCacheController:
         # broadcasts loaded GPU pages to the other ranks.
         # FP4 is excluded: it keeps an extra per-rank scale buffer that this
         # broadcast does not replicate (MLATokenToKVPoolFP4 subclasses MLA).
+        # Dedup only engages with a dedup-compatible storage backend (see
+        # storage_supports_host_dedup): the non-rank-0 dummy pool has no host
+        # buffer, which RDMA/registered L3 backends cannot tolerate. Must match
+        # the dummy-pool decision in HiRadixCache / the hybrid assembler.
         self.is_mla = (
             isinstance(self.mem_pool_device, MLATokenToKVPool)
             and not isinstance(self.mem_pool_device, MLATokenToKVPoolFP4)
             and is_cuda()
+            and storage_supports_host_dedup(storage_backend)
         )
         # DSA additionally stores a per-page indexer buffer that must be
         # broadcast alongside the MLA latent (DSATokenToKVPool subclasses MLA).
@@ -578,7 +598,17 @@ class HiCacheController:
             self.storage_backend = StorageBackendFactory.create_backend(
                 storage_backend, self.storage_config, self.mem_pool_host
             )
-            self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+            # A dummy (non-rank-0 dedup) host pool has no KV buffer to register;
+            # backends that pin/register the buffer (Mooncake/SiMM/EIC) would
+            # crash on the None buffer. Non-rank-0 never reads L3 anyway (see
+            # _page_transfer), so skip registration for it.
+            if getattr(self.mem_pool_host, "_is_dummy", False):
+                logger.info(
+                    "Skipping register_mem_pool_host on dummy (non-rank-0 dedup) "
+                    "host pool with no KV buffer."
+                )
+            else:
+                self.storage_backend.register_mem_pool_host(self.mem_pool_host)
 
             self.enable_storage = True
             # todo: threshold policy for prefetching

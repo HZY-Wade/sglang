@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from sglang.srt.managers.cache_controller import storage_supports_host_dedup
 from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -118,6 +119,7 @@ def build_kv_only_stack(
     pp_rank: int = 0,
     pp_size: int = 1,
     enable_storage_metrics: bool = False,
+    is_dummy: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -126,6 +128,7 @@ def build_kv_only_stack(
         server_args=server_args,
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
+        is_dummy=is_dummy,
     )
     entries = [
         build_pool_entry(
@@ -964,6 +967,7 @@ class _DsaStrategy(StackStrategy):
             and mla_tp_size > 1
             and mla_tp_rank != 0
             and not isinstance(kvcache, MLATokenToKVPoolFP4)
+            and storage_supports_host_dedup(storage_backend)
         )
 
         full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
@@ -1047,10 +1051,42 @@ class _PlainKvStrategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ):
-        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang.srt.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+        from sglang.srt.layers.dp_attention import (
+            get_attention_tp_rank,
+            get_attention_tp_size,
+            is_dp_attention_enabled,
+        )
+        from sglang.srt.mem_cache.memory_pool import (
+            MLATokenToKVPool,
+            MLATokenToKVPoolFP4,
+        )
+        from sglang.srt.utils import is_cuda
 
         full_kv_pool = kvcache
         use_mla = isinstance(kvcache, MLATokenToKVPool)
+
+        # MLA host-memory dedup for the plain (unified) MLA path: non-rank-0
+        # attention-TP ranks use a dummy (allocator-only) host pool. Gating must
+        # match HiCacheController (FP4 excluded; dedup-compatible storage only).
+        if is_dp_attention_enabled():
+            mla_tp_rank = get_attention_tp_rank()
+            mla_tp_size = get_attention_tp_size()
+        else:
+            mla_tp_rank = get_tensor_model_parallel_rank()
+            mla_tp_size = get_tensor_model_parallel_world_size()
+        mla_is_dummy = (
+            use_mla
+            and is_cuda()
+            and mla_tp_size > 1
+            and mla_tp_rank != 0
+            and not isinstance(kvcache, MLATokenToKVPoolFP4)
+            and storage_supports_host_dedup(storage_backend)
+        )
+
         full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
         host_pool_group, cache_controller = build_kv_only_stack(
             params=params,
@@ -1070,6 +1106,7 @@ class _PlainKvStrategy(StackStrategy):
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
             enable_storage_metrics=enable_storage_metrics,
+            is_dummy=mla_is_dummy,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -1192,8 +1229,40 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
     This entrypoint is currently intended only for HiRadixCache's DSA path.
     """
     try:
+        from sglang.srt.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+        from sglang.srt.layers.dp_attention import (
+            get_attention_tp_rank,
+            get_attention_tp_size,
+            is_dp_attention_enabled,
+        )
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolFP4
+        from sglang.srt.utils import is_cuda
+
         kv = radix_cache.kv_cache
         layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
+
+        # MLA/DSA host-memory dedup: non-rank-0 attention-TP ranks use dummy
+        # (allocator-only) host pools; rank 0 owns the host copy and broadcasts.
+        # Keep in sync with HiCacheController gating (FP4 excluded). The sidecar
+        # factory now takes (kv_host_pool, is_dummy) -- build_anchor_sidecar_stack
+        # calls it with two args.
+        if is_dp_attention_enabled():
+            mla_tp_rank = get_attention_tp_rank()
+            mla_tp_size = get_attention_tp_size()
+        else:
+            mla_tp_rank = get_tensor_model_parallel_rank()
+            mla_tp_size = get_tensor_model_parallel_world_size()
+        mla_is_dummy = (
+            is_cuda()
+            and mla_tp_size > 1
+            and mla_tp_rank != 0
+            and not isinstance(kv, MLATokenToKVPoolFP4)
+            and storage_supports_host_dedup(server_args.hicache_storage_backend)
+        )
+
         host_pool_group, cache_controller = build_anchor_sidecar_stack(
             params=params,
             server_args=server_args,
@@ -1209,17 +1278,19 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
             use_mla=True,
             override_kv_cache_dim=kv.kv_cache_dim,
             prefetch_threshold=prefetch_threshold,
-            sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
+            sidecar_host_pool_factory=lambda kv_host_pool, idx_is_dummy: DSAIndexerPoolHost(
                 kv,
                 kv_host_pool,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                is_dummy=idx_is_dummy,
             ),
             model_name=server_args.served_model_name,
             storage_backend_extra_config=extra_config,
             pp_rank=radix_cache.pp_rank,
             pp_size=radix_cache.pp_size,
             enable_storage_metrics=enable_storage_metrics,
+            is_dummy=mla_is_dummy,
         )
         radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         radix_cache.token_to_kv_pool_host = host_pool_group

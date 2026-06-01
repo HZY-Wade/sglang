@@ -13,7 +13,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
-from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.managers.cache_controller import (
+    HiCacheController,
+    PrefetchOperation,
+    storage_supports_host_dedup,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -110,14 +114,16 @@ class HiRadixCache(RadixCache):
                 mla_tp_rank = get_tensor_model_parallel_rank()
                 mla_tp_size = get_tensor_model_parallel_world_size()
             # Keep this in sync with HiCacheController dedup gating. FP4 pools
-            # are excluded (extra scale buffer the broadcast can't carry). L3
-            # storage coexists: only rank 0 prefetches into host, others receive
-            # data via the load-time broadcast (see _page_transfer).
+            # are excluded (extra scale buffer the broadcast can't carry). Dedup
+            # only engages with a dedup-compatible storage backend (no L3 or the
+            # file backend); RDMA/registered backends can't tolerate the dummy
+            # pool's missing host buffer, so every rank keeps a full pool there.
             mla_is_dummy = (
                 is_cuda()
                 and mla_tp_size > 1
                 and mla_tp_rank != 0
                 and not isinstance(self.kv_cache, MLATokenToKVPoolFP4)
+                and storage_supports_host_dedup(server_args.hicache_storage_backend)
             )
 
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
