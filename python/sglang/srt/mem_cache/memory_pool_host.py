@@ -963,6 +963,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
         for registering host memory with the disaggregation transfer engine."""
+        if self._is_dummy:
+            # Non-rank-0 MLA dedup ranks own no host buffer (data_ptrs/kv_buffer
+            # are None). There is nothing to register with the transfer engine.
+            return [], [], []
         data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
         data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
         item_lens = [self.token_stride_size * self.page_size] * self.layer_num
