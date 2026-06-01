@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
+    MLATokenToKVPoolFP4,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
@@ -108,7 +109,16 @@ class HiRadixCache(RadixCache):
             else:
                 mla_tp_rank = get_tensor_model_parallel_rank()
                 mla_tp_size = get_tensor_model_parallel_world_size()
-            mla_is_dummy = is_cuda() and mla_tp_size > 1 and mla_tp_rank != 0
+            # Keep this in sync with HiCacheController dedup gating. FP4 pools
+            # are excluded (extra scale buffer the broadcast can't carry). L3
+            # storage coexists: only rank 0 prefetches into host, others receive
+            # data via the load-time broadcast (see _page_transfer).
+            mla_is_dummy = (
+                is_cuda()
+                and mla_tp_size > 1
+                and mla_tp_rank != 0
+                and not isinstance(self.kv_cache, MLATokenToKVPoolFP4)
+            )
 
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,

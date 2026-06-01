@@ -940,7 +940,10 @@ class _DsaStrategy(StackStrategy):
             get_attention_tp_size,
             is_dp_attention_enabled,
         )
-        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang.srt.mem_cache.memory_pool import (
+            MLATokenToKVPool,
+            MLATokenToKVPoolFP4,
+        )
         from sglang.srt.utils import is_cuda
 
         full_kv_pool = kvcache
@@ -948,13 +951,20 @@ class _DsaStrategy(StackStrategy):
 
         # MLA/DSA host-memory dedup: non-rank-0 attention-TP ranks use dummy
         # (allocator-only) host pools; rank 0 owns the host copy and broadcasts.
+        # Keep this in sync with HiCacheController dedup gating: FP4 pools are
+        # excluded (extra scale buffer the broadcast can't carry).
         if is_dp_attention_enabled():
             mla_tp_rank = get_attention_tp_rank()
             mla_tp_size = get_attention_tp_size()
         else:
             mla_tp_rank = get_tensor_model_parallel_rank()
             mla_tp_size = get_tensor_model_parallel_world_size()
-        mla_is_dummy = is_cuda() and mla_tp_size > 1 and mla_tp_rank != 0
+        mla_is_dummy = (
+            is_cuda()
+            and mla_tp_size > 1
+            and mla_tp_rank != 0
+            and not isinstance(kvcache, MLATokenToKVPoolFP4)
+        )
 
         full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
         host_pool_group, cache_controller = build_anchor_sidecar_stack(

@@ -41,7 +41,11 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    MLATokenToKVPool,
+    MLATokenToKVPoolFP4,
+)
 from sglang.srt.utils import get_device_module, is_cuda
 
 logger = logging.getLogger(__name__)
@@ -326,7 +330,13 @@ class HiCacheController:
 
         # MLA KV is identical across TP ranks; rank 0 owns the host copy and
         # broadcasts loaded GPU pages to the other ranks.
-        self.is_mla = isinstance(self.mem_pool_device, MLATokenToKVPool) and is_cuda()
+        # FP4 is excluded: it keeps an extra per-rank scale buffer that this
+        # broadcast does not replicate (MLATokenToKVPoolFP4 subclasses MLA).
+        self.is_mla = (
+            isinstance(self.mem_pool_device, MLATokenToKVPool)
+            and not isinstance(self.mem_pool_device, MLATokenToKVPoolFP4)
+            and is_cuda()
+        )
         # DSA additionally stores a per-page indexer buffer that must be
         # broadcast alongside the MLA latent (DSATokenToKVPool subclasses MLA).
         self.is_dsa = isinstance(self.mem_pool_device, DSATokenToKVPool)
@@ -935,6 +945,10 @@ class HiCacheController:
                     host_indices.record_stream(self.load_stream)
                 if device_indices.is_cuda:
                     device_indices.record_stream(self.load_stream)
+                # The "direct" io backend may issue H2D off load_stream, so plain
+                # stream ordering is not enough; fully land rank 0's H2D before
+                # the broadcast reads the device KV buffer.
+                self.load_stream.synchronize()
 
             self._broadcast_mla_kv(op.device_indices)
             for i in range(self.layer_num):
@@ -1098,6 +1112,15 @@ class HiCacheController:
                 break  # Operation terminated by controller
 
     def _page_transfer(self, operation):
+        # MLA dedup: non-rank-0 ranks have a dummy host pool (no kv_buffer), so
+        # only rank 0 reads L3 into host; the other ranks receive the data via
+        # the load-time broadcast. Mark the prefetch complete here so the
+        # cross-rank accounting (already MIN-synced in _storage_hit_query) and
+        # host-slot bookkeeping stay consistent without touching the dummy pool.
+        # (Backup is already rank-0-only via self.backup_skip.)
+        if self.mla_broadcast_enabled and self._mla_tp_rank != 0:
+            operation.completed_tokens += len(operation.hash_value) * self.page_size
+            return
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
