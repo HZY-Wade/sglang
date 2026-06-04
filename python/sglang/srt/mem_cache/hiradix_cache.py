@@ -82,6 +82,23 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
+        # Pre-rendezvous BOTH world-collectives HiCacheController would issue
+        # at init time — the NCCL mla_bcast_group AND the gloo
+        # prefetch_sync_groups — BEFORE any slow HostKVCache allocation below.
+        # Without this, rank 0 can spend 20-30 min pinning hundreds of GB of
+        # host KV while non-rank-0 attn-TP ranks race ahead through the dummy
+        # fast path, hit the next world all_gather_object inside
+        # create_custom_parallel_group, and trip the 600s NCCL watchdog that
+        # kills every rank in lockstep (seen on prod TP=16, --hicache-size 800).
+        # See HiCacheController.prebuild_mla_broadcast_state for the full
+        # rationale. Gating mirrors HiCacheController.is_mla so we don't build
+        # a group on ranks the controller will then ignore: FP4 pools and
+        # non-dedup storage backends keep full per-rank host pools and have
+        # no slow-rank-0 asymmetry, so there's no race to head off there.
+        self._mla_broadcast_state = self._maybe_prebuild_mla_broadcast_state(
+            params, server_args
+        )
+
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
@@ -172,6 +189,7 @@ class HiRadixCache(RadixCache):
                 load_cache_event=self.load_cache_event,
                 attn_cp_group=self.attn_cp_group,
                 attn_tp_group=self.attn_tp_group,
+                mla_broadcast_state=self._mla_broadcast_state,
             )
         else:
             self.cache_controller = HiCacheController(
@@ -191,6 +209,7 @@ class HiRadixCache(RadixCache):
                 pp_rank=self.pp_rank,
                 pp_size=self.pp_size,
                 enable_storage_metrics=self.enable_storage_metrics,
+                mla_broadcast_state=self._mla_broadcast_state,
             )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -224,6 +243,60 @@ class HiRadixCache(RadixCache):
         self.evictable_host_leaves = set()
 
         super().__init__(params=params)
+
+    def _maybe_prebuild_mla_broadcast_state(
+        self, params: CacheInitParams, server_args: ServerArgs
+    ) -> Optional[dict]:
+        """Decide whether to pre-rendezvous HiCacheController's world
+        collectives before the slow HostKVCache alloc, and do it if so.
+
+        Returns the state dict to pass to HiCacheController(...) as
+        mla_broadcast_state, or None when no rendezvous is needed (MHA, FP4,
+        non-cuda, mla_tp_size == 1, or a non-dedup storage backend).
+
+        Keep the gating in lockstep with HiCacheController.is_mla — otherwise
+        we'd build a group on ranks the controller would then ignore, which
+        leaves a leaked NCCL group plus a desynchronized rendezvous count.
+        """
+        # MLATokenToKVPool covers both MLA and DSA (DSATokenToKVPool subclasses
+        # it). FP4 keeps a separate per-rank scale buffer the broadcast can't
+        # carry, so it stays out. Non-dedup storage backends (Mooncake/EIC/
+        # SiMM/HF3FS/NIxl/AiBrix) pin or register the host KV buffer and can't
+        # tolerate the dummy pool — every rank keeps a full host pool there,
+        # rank 0 has no asymmetric multi-minute pin, no race to head off.
+        if not (
+            isinstance(self.kv_cache, MLATokenToKVPool)
+            and not isinstance(self.kv_cache, MLATokenToKVPoolFP4)
+            and storage_supports_host_dedup(server_args.hicache_storage_backend)
+        ):
+            return None
+        from sglang.srt.distributed import (
+            get_tensor_model_parallel_world_size,
+        )
+        from sglang.srt.layers.dp_attention import (
+            get_attention_tp_size,
+            is_dp_attention_enabled,
+        )
+        from sglang.srt.utils import is_cuda
+
+        if not is_cuda():
+            return None
+        if is_dp_attention_enabled():
+            mla_tp_size = get_attention_tp_size()
+        else:
+            mla_tp_size = get_tensor_model_parallel_world_size()
+        if mla_tp_size <= 1:
+            return None
+        return HiCacheController.prebuild_mla_broadcast_state(
+            self.kv_cache,
+            params.tp_cache_group,
+            params.attn_cp_cache_group,
+            params.attn_tp_cache_group,
+            self.kv_cache.layer_num,
+            self.kv_cache.device,
+            is_dsa=isinstance(self.kv_cache, DSATokenToKVPool),
+            enable_storage=server_args.hicache_storage_backend is not None,
+        )
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False

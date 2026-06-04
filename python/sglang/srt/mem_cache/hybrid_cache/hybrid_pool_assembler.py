@@ -603,6 +603,7 @@ def build_anchor_sidecar_stack(
     pp_size: int = 1,
     enable_storage_metrics: bool = False,
     is_dummy: bool = False,
+    mla_broadcast_state: Optional[dict] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -650,6 +651,7 @@ def build_anchor_sidecar_stack(
         pp_size=pp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        mla_broadcast_state=mla_broadcast_state,
     )
     return host_pool_group, cache_controller
 
@@ -1223,6 +1225,7 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
     load_cache_event,
     attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    mla_broadcast_state: Optional[dict] = None,
 ) -> None:
     """Attach HostPoolGroup (KV + indexer) + HybridCacheController for HiRadixCache.
 
@@ -1291,6 +1294,7 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
             pp_size=radix_cache.pp_size,
             enable_storage_metrics=enable_storage_metrics,
             is_dummy=mla_is_dummy,
+            mla_broadcast_state=mla_broadcast_state,
         )
         radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         radix_cache.token_to_kv_pool_host = host_pool_group

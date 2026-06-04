@@ -280,11 +280,25 @@ class HiCacheController:
         pp_rank: int = 0,
         pp_size: int = 1,
         enable_storage_metrics: bool = False,
+        mla_broadcast_state: Optional[dict] = None,
     ):
         self.tp_group = tp_group
         self.attn_cp_group = attn_cp_group
         self.attn_tp_group = attn_tp_group
         self.prefetch_sync_groups: List[torch.distributed.ProcessGroup] = []
+        # Optional prebuilt rendezvous state from HiRadixCache (created BEFORE
+        # the slow rank-0 host KV alloc, see prebuild_mla_broadcast_state for
+        # the 10-min NCCL watchdog story). Consumed in this __init__ for the
+        # MLA broadcast group, and in _create_prefetch_sync_groups for the
+        # gloo prefetch groups. Cleared after consumption so any future
+        # runtime detach→re-attach builds fresh.
+        self._prebuilt_prefetch_sync_groups: Optional[
+            List[torch.distributed.ProcessGroup]
+        ] = (
+            mla_broadcast_state.get("prefetch_sync_groups")
+            if mla_broadcast_state is not None
+            else None
+        )
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -369,7 +383,21 @@ class HiCacheController:
                 self._mla_tp_rank = get_tensor_model_parallel_rank()
                 self._mla_tp_size = get_tensor_model_parallel_world_size()
             if self._mla_tp_size > 1:
-                self._init_mla_broadcast()
+                if mla_broadcast_state is not None:
+                    # Pre-built by HiRadixCache BEFORE HostKVCache alloc, so
+                    # the world all_gather_object inside
+                    # create_custom_parallel_group did NOT race rank 0's
+                    # multi-minute host KV pin against the 600s NCCL watchdog.
+                    self.mla_bcast_group = mla_broadcast_state["mla_bcast_group"]
+                    self._mla_bcast_src = mla_broadcast_state["mla_bcast_src"]
+                    self._mla_bt_num_tokens = mla_broadcast_state["mla_bt_num_tokens"]
+                    self._mla_bt = mla_broadcast_state["mla_bt"]
+                    self._mla_idx_bufs = mla_broadcast_state["mla_idx_bufs"]
+                    if self._mla_idx_bufs is not None:
+                        self._mla_idx_elem = mla_broadcast_state["mla_idx_elem"]
+                        self._mla_idx_bt = mla_broadcast_state["mla_idx_bt"]
+                else:
+                    self._init_mla_broadcast()
         else:
             self._mla_tp_rank = 0
             self._mla_tp_size = 1
@@ -393,40 +421,142 @@ class HiCacheController:
         return self.is_mla and self.mla_bcast_group is not None
 
     def _init_mla_broadcast(self) -> None:
+        # Delegate to the static helper so the runtime detach→re-attach path
+        # (which has no prebuilt state) and the early-prebuild path share one
+        # construction code path.
+        state = HiCacheController.prebuild_mla_broadcast_state(
+            self.mem_pool_device,
+            self.tp_group,
+            self.attn_cp_group,
+            self.attn_tp_group,
+            self.layer_num,
+            self.device,
+            is_dsa=self.is_dsa,
+            enable_storage=False,
+        )
+        self.mla_bcast_group = state["mla_bcast_group"]
+        self._mla_bcast_src = state["mla_bcast_src"]
+        self._mla_bt_num_tokens = state["mla_bt_num_tokens"]
+        self._mla_bt = state["mla_bt"]
+        self._mla_idx_bufs = state["mla_idx_bufs"]
+        if self._mla_idx_bufs is not None:
+            self._mla_idx_elem = state["mla_idx_elem"]
+            self._mla_idx_bt = state["mla_idx_bt"]
+
+    @staticmethod
+    def prebuild_mla_broadcast_state(
+        mem_pool_device,
+        tp_group: torch.distributed.ProcessGroup,
+        attn_cp_group: Optional[torch.distributed.ProcessGroup],
+        attn_tp_group: Optional[torch.distributed.ProcessGroup],
+        layer_num: int,
+        device,
+        *,
+        is_dsa: bool,
+        enable_storage: bool = False,
+    ) -> dict:
+        """Create every world-collective HiCacheController would issue at
+        init time BEFORE HostKVCache is allocated.
+
+        Why: HostKVCache.__init__ on rank 0 pins the full host KV (can exceed
+        the 10-min NCCL watchdog at 800GB), while non-rank-0 attn-TP ranks
+        hit the dummy fast path and race ahead to the next world-collective.
+        Two collectives downstream would otherwise race rank 0's slow pin:
+          (a) _init_mla_broadcast → create_custom_parallel_group(nccl) for
+              the mla_bcast_group  (broadcast loaded KV across attn-TP);
+          (b) attach_storage_backend → _create_prefetch_sync_groups →
+              create_custom_parallel_group(gloo) for prefetch_sync_groups
+              (only with --hicache-storage-backend; coordinates L3
+              prefetch/eviction across ranks).
+        Both go through an all_gather_object + new_group on the default-world
+        NCCL comm, whose watchdog kills the proc at 600s.
+
+        Calling this BEFORE HostKVCache means the rendezvouses happen while
+        rank 0 has not started pinning yet — they complete in <1s on all
+        ranks in lockstep, and rank 0 is then free to take its time pinning
+        without racing any further collective.
+
+        Returns a dict to be passed into HiCacheController(...) via
+        mla_broadcast_state=...
+            HiCacheController.__init__ uses the prebuilt mla_bcast_group;
+            _create_prefetch_sync_groups uses the prebuilt
+            prefetch_sync_groups if present.
+        """
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
-        base_group = self.tp_group
-        if is_dp_attention_enabled() and self.attn_tp_group is not None:
-            base_group = self.attn_tp_group
+        base_group = tp_group
+        if is_dp_attention_enabled() and attn_tp_group is not None:
+            base_group = attn_tp_group
         group_ranks = torch.distributed.get_process_group_ranks(base_group)
 
-        # Dedicated NCCL group so the load-time broadcast never interleaves with
-        # the model-forward collectives.
-        self.mla_bcast_group = create_custom_parallel_group(
+        # Dedicated NCCL group so the load-time broadcast never interleaves
+        # with the model-forward collectives.
+        mla_bcast_group = create_custom_parallel_group(
             group_ranks=list(group_ranks), backend="nccl"
         )
-        self._mla_bcast_src = group_ranks[0]
+        mla_bcast_src = group_ranks[0]
 
-        # Staging buffer coalescing all layers of one token chunk into a single
-        # broadcast; reused across loads and bounded by bt_num_tokens.
-        self._mla_bt_num_tokens = 512
-        self._mla_bt = torch.empty(
-            self.layer_num
-            * self._mla_bt_num_tokens
-            * self.mem_pool_device.kv_cache_dim,
-            dtype=self.mem_pool_device.kv_buffer[0].dtype,
-            device=self.device,
+        # Staging buffer coalescing all layers of one token chunk into a
+        # single broadcast; reused across loads and bounded by bt_num_tokens.
+        mla_bt_num_tokens = 512
+        mla_bt = torch.empty(
+            layer_num * mla_bt_num_tokens * mem_pool_device.kv_cache_dim,
+            dtype=mem_pool_device.kv_buffer[0].dtype,
+            device=device,
         )
-        # DSA also stores a per-page indexer buffer that must be broadcast too.
-        self._mla_idx_bufs = None
-        if self.is_dsa:
-            self._mla_idx_bufs = self.mem_pool_device.index_k_with_scale_buffer
-            self._mla_idx_elem = math.prod(self._mla_idx_bufs[0].shape[1:]) or 1
-            self._mla_idx_bt = torch.empty(
-                self.layer_num * self._mla_bt_num_tokens * self._mla_idx_elem,
-                dtype=self._mla_idx_bufs[0].dtype,
-                device=self.device,
+        # DSA also stores a per-page indexer buffer that must be broadcast.
+        mla_idx_bufs = None
+        mla_idx_elem = None
+        mla_idx_bt = None
+        if is_dsa:
+            mla_idx_bufs = mem_pool_device.index_k_with_scale_buffer
+            mla_idx_elem = math.prod(mla_idx_bufs[0].shape[1:]) or 1
+            mla_idx_bt = torch.empty(
+                layer_num * mla_bt_num_tokens * mla_idx_elem,
+                dtype=mla_idx_bufs[0].dtype,
+                device=device,
             )
+
+        # Prefetch sync group rendezvouses (storage-backend path only). Mirror
+        # _create_prefetch_sync_groups: CP+TP attn groups if either is set,
+        # else the model-tp group. Dedupe by rank-set so a CP=1 case doesn't
+        # double-build the same gloo group.
+        #
+        # Stays None when enable_storage=False, so that a later runtime
+        # attach_storage_backend (with no prebuilt groups) still goes through
+        # the normal inline build path in _create_prefetch_sync_groups instead
+        # of consuming an empty prebuilt list and ending up with zero groups.
+        prefetch_sync_groups: Optional[List[torch.distributed.ProcessGroup]] = None
+        if enable_storage:
+            prefetch_sync_groups = []
+            seen_rank_sets = set()
+            if attn_cp_group is not None or attn_tp_group is not None:
+                base_groups = [attn_cp_group, attn_tp_group]
+            else:
+                base_groups = [tp_group]
+            for group in base_groups:
+                if group is None or torch.distributed.get_world_size(group=group) == 1:
+                    continue
+                ranks = tuple(torch.distributed.get_process_group_ranks(group))
+                if ranks in seen_rank_sets:
+                    continue
+                seen_rank_sets.add(ranks)
+                prefetch_sync_groups.append(
+                    create_custom_parallel_group(
+                        group_ranks=list(ranks), backend="gloo"
+                    )
+                )
+
+        return {
+            "mla_bcast_group": mla_bcast_group,
+            "mla_bcast_src": mla_bcast_src,
+            "mla_bt_num_tokens": mla_bt_num_tokens,
+            "mla_bt": mla_bt,
+            "mla_idx_bufs": mla_idx_bufs,
+            "mla_idx_elem": mla_idx_elem,
+            "mla_idx_bt": mla_idx_bt,
+            "prefetch_sync_groups": prefetch_sync_groups,
+        }
 
     def _destroy_mla_broadcast_group(self) -> None:
         if self.mla_bcast_group is not None:
@@ -446,6 +576,15 @@ class HiCacheController:
         return 0, 1
 
     def _create_prefetch_sync_groups(self) -> None:
+        # If HiRadixCache prebuilt the gloo groups BEFORE the slow host KV
+        # alloc (to avoid the 600s NCCL watchdog race — see
+        # prebuild_mla_broadcast_state), reuse them and clear the slot so a
+        # later runtime detach→re-attach builds fresh.
+        if self._prebuilt_prefetch_sync_groups is not None:
+            self.prefetch_sync_groups = self._prebuilt_prefetch_sync_groups
+            self._prebuilt_prefetch_sync_groups = None
+            return
+
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
         self.prefetch_sync_groups = []

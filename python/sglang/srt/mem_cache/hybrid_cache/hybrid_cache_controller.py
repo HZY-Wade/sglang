@@ -175,6 +175,7 @@ class HybridCacheController(BaseHiCacheController):
         pp_size: int = 1,
         transfer_layer_num: Optional[int] = None,
         enable_storage_metrics: bool = False,
+        mla_broadcast_state: Optional[dict] = None,
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue] = {}
@@ -195,6 +196,7 @@ class HybridCacheController(BaseHiCacheController):
             pp_rank=pp_rank,
             pp_size=pp_size,
             enable_storage_metrics=enable_storage_metrics,
+            mla_broadcast_state=mla_broadcast_state,
         )
         # The base is_mla/broadcast gate ran with storage_backend=None (this
         # controller attaches storage afterwards), so re-apply the dedup storage
