@@ -120,6 +120,7 @@ def build_kv_only_stack(
     pp_size: int = 1,
     enable_storage_metrics: bool = False,
     is_dummy: bool = False,
+    mla_broadcast_state: Optional[dict] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -159,6 +160,7 @@ def build_kv_only_stack(
         pp_size=pp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        mla_broadcast_state=mla_broadcast_state,
     )
     return host_pool_group, cache_controller
 
@@ -945,6 +947,7 @@ class _DsaStrategy(StackStrategy):
             get_attention_tp_size,
             is_dp_attention_enabled,
         )
+        from sglang.srt.managers.cache_controller import HiCacheController
         from sglang.srt.mem_cache.memory_pool import (
             MLATokenToKVPool,
             MLATokenToKVPoolFP4,
@@ -970,6 +973,19 @@ class _DsaStrategy(StackStrategy):
             and mla_tp_rank != 0
             and not isinstance(kvcache, MLATokenToKVPoolFP4)
             and storage_supports_host_dedup(storage_backend)
+        )
+
+        # Pre-rendezvous BEFORE build_anchor_sidecar_stack allocates the host
+        # pool. Without this, rank 0's multi-minute DSA host KV pin races
+        # non-rank-0's create_custom_parallel_group inside the controller's
+        # __init__ and trips the 600s NCCL watchdog (same race as HiRadixCache
+        # path; see HiCacheController.prebuild_mla_broadcast_state).
+        mla_broadcast_state = HiCacheController.maybe_prebuild_mla_broadcast_state(
+            kvcache,
+            params.tp_cache_group,
+            attn_cp_group,
+            attn_tp_group,
+            storage_backend,
         )
 
         full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
@@ -1001,6 +1017,7 @@ class _DsaStrategy(StackStrategy):
             pp_size=params.pp_size,
             enable_storage_metrics=enable_storage_metrics,
             is_dummy=mla_is_dummy,
+            mla_broadcast_state=mla_broadcast_state,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -1062,6 +1079,7 @@ class _PlainKvStrategy(StackStrategy):
             get_attention_tp_size,
             is_dp_attention_enabled,
         )
+        from sglang.srt.managers.cache_controller import HiCacheController
         from sglang.srt.mem_cache.memory_pool import (
             MLATokenToKVPool,
             MLATokenToKVPoolFP4,
@@ -1089,6 +1107,19 @@ class _PlainKvStrategy(StackStrategy):
             and storage_supports_host_dedup(storage_backend)
         )
 
+        # Pre-rendezvous BEFORE build_kv_only_stack allocates the host pool.
+        # Without this, rank 0's multi-minute MLA host KV pin races non-rank-0
+        # ranks into HybridCacheController's create_custom_parallel_group and
+        # trips the 600s NCCL watchdog. Same race as the HiRadixCache and DSA
+        # paths — see HiCacheController.prebuild_mla_broadcast_state.
+        mla_broadcast_state = HiCacheController.maybe_prebuild_mla_broadcast_state(
+            kvcache,
+            params.tp_cache_group,
+            attn_cp_group,
+            attn_tp_group,
+            storage_backend,
+        )
+
         full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
         host_pool_group, cache_controller = build_kv_only_stack(
             params=params,
@@ -1109,6 +1140,7 @@ class _PlainKvStrategy(StackStrategy):
             pp_size=params.pp_size,
             enable_storage_metrics=enable_storage_metrics,
             is_dummy=mla_is_dummy,
+            mla_broadcast_state=mla_broadcast_state,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,

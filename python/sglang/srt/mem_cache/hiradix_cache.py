@@ -247,55 +247,17 @@ class HiRadixCache(RadixCache):
     def _maybe_prebuild_mla_broadcast_state(
         self, params: CacheInitParams, server_args: ServerArgs
     ) -> Optional[dict]:
-        """Decide whether to pre-rendezvous HiCacheController's world
-        collectives before the slow HostKVCache alloc, and do it if so.
-
-        Returns the state dict to pass to HiCacheController(...) as
-        mla_broadcast_state, or None when no rendezvous is needed (MHA, FP4,
-        non-cuda, mla_tp_size == 1, or a non-dedup storage backend).
-
-        Keep the gating in lockstep with HiCacheController.is_mla — otherwise
-        we'd build a group on ranks the controller would then ignore, which
-        leaves a leaked NCCL group plus a desynchronized rendezvous count.
+        """Thin wrapper around HiCacheController.maybe_prebuild_mla_broadcast_state
+        for HiRadixCache's init time. Centralizing the gating there keeps the
+        non-DSA MLA path, the DSA hybrid path, and the unified assembler
+        strategies in lockstep with HiCacheController.is_mla.
         """
-        # MLATokenToKVPool covers both MLA and DSA (DSATokenToKVPool subclasses
-        # it). FP4 keeps a separate per-rank scale buffer the broadcast can't
-        # carry, so it stays out. Non-dedup storage backends (Mooncake/EIC/
-        # SiMM/HF3FS/NIxl/AiBrix) pin or register the host KV buffer and can't
-        # tolerate the dummy pool — every rank keeps a full host pool there,
-        # rank 0 has no asymmetric multi-minute pin, no race to head off.
-        if not (
-            isinstance(self.kv_cache, MLATokenToKVPool)
-            and not isinstance(self.kv_cache, MLATokenToKVPoolFP4)
-            and storage_supports_host_dedup(server_args.hicache_storage_backend)
-        ):
-            return None
-        from sglang.srt.distributed import (
-            get_tensor_model_parallel_world_size,
-        )
-        from sglang.srt.layers.dp_attention import (
-            get_attention_tp_size,
-            is_dp_attention_enabled,
-        )
-        from sglang.srt.utils import is_cuda
-
-        if not is_cuda():
-            return None
-        if is_dp_attention_enabled():
-            mla_tp_size = get_attention_tp_size()
-        else:
-            mla_tp_size = get_tensor_model_parallel_world_size()
-        if mla_tp_size <= 1:
-            return None
-        return HiCacheController.prebuild_mla_broadcast_state(
+        return HiCacheController.maybe_prebuild_mla_broadcast_state(
             self.kv_cache,
             params.tp_cache_group,
             params.attn_cp_cache_group,
             params.attn_tp_cache_group,
-            self.kv_cache.layer_num,
-            self.kv_cache.device,
-            is_dsa=isinstance(self.kv_cache, DSATokenToKVPool),
-            enable_storage=server_args.hicache_storage_backend is not None,
+            server_args.hicache_storage_backend,
         )
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):

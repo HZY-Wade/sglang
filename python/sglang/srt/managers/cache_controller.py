@@ -558,6 +558,52 @@ class HiCacheController:
             "prefetch_sync_groups": prefetch_sync_groups,
         }
 
+    @staticmethod
+    def maybe_prebuild_mla_broadcast_state(
+        kv_cache,
+        tp_group: torch.distributed.ProcessGroup,
+        attn_cp_group: Optional[torch.distributed.ProcessGroup],
+        attn_tp_group: Optional[torch.distributed.ProcessGroup],
+        storage_backend: Optional[str],
+    ) -> Optional[dict]:
+        """Gated convenience wrapper around prebuild_mla_broadcast_state.
+
+        Returns None when no rendezvous is needed (MHA, FP4, non-cuda,
+        mla_tp_size == 1, or a non-dedup-compatible storage backend), else
+        the state dict to pass to HiCacheController(...) via
+        mla_broadcast_state=...
+
+        Gating must mirror HiCacheController.is_mla (minus the per-rank
+        check) so we don't build a group on ranks the controller would
+        then ignore — that would leak the NCCL group AND desync the
+        rendezvous counter. Shared between HiRadixCache and the unified
+        assembler strategies.
+        """
+        if not (
+            isinstance(kv_cache, MLATokenToKVPool)
+            and not isinstance(kv_cache, MLATokenToKVPoolFP4)
+            and storage_supports_host_dedup(storage_backend)
+        ):
+            return None
+        if not is_cuda():
+            return None
+        if is_dp_attention_enabled():
+            mla_tp_size = get_attention_tp_size()
+        else:
+            mla_tp_size = get_tensor_model_parallel_world_size()
+        if mla_tp_size <= 1:
+            return None
+        return HiCacheController.prebuild_mla_broadcast_state(
+            kv_cache,
+            tp_group,
+            attn_cp_group,
+            attn_tp_group,
+            kv_cache.layer_num,
+            kv_cache.device,
+            is_dsa=isinstance(kv_cache, DSATokenToKVPool),
+            enable_storage=storage_backend is not None,
+        )
+
     def _destroy_mla_broadcast_group(self) -> None:
         if self.mla_bcast_group is not None:
             try:
@@ -704,6 +750,32 @@ class HiCacheController:
         """
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
+
+        # Reject backends that cannot tolerate a dummy host pool.
+        #
+        # When startup --hicache-storage-backend was unset (or "file"),
+        # storage_supports_host_dedup(...) was True, so non-rank-0 MLA/NSA
+        # attn-TP ranks were built with allocator-only dummy host pools
+        # (kv_buffer is None). The RDMA/registered backends — mooncake / eic /
+        # simm / hf3fs / nixl / aibrix — pin or register that buffer at
+        # construct or register time and would dereference None. We have no
+        # safe way to rebuild full host pools across all ranks at runtime
+        # (allocating hundreds of GB would itself re-introduce the watchdog
+        # race this commit's earlier prebuild was meant to head off), so the
+        # only correct behavior is to refuse. Restart with the desired
+        # backend on the CLI if you need one of these.
+        if getattr(
+            self.mem_pool_host, "_is_dummy", False
+        ) and not storage_supports_host_dedup(storage_backend):
+            raise RuntimeError(
+                f"Cannot runtime-attach non-dedup-compatible storage backend "
+                f"{storage_backend!r} to a dummy MLA/NSA host pool: this rank "
+                f"was started without storage (or with a dedup-compatible "
+                f"backend), so its host KV buffer is None. Only None/''/'file' "
+                f"backends can attach later on a dummy pool. Restart the "
+                f"server with --hicache-storage-backend={storage_backend} to "
+                f"use this backend."
+            )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
