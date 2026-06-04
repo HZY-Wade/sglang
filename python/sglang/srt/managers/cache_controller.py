@@ -1247,6 +1247,8 @@ class HiCacheController:
         indices = device_indices
         if not indices.is_cuda:
             indices = indices.to(self.device)
+        if indices.is_cuda:
+            indices.record_stream(self.load_stream)
         self._bcast_buf(
             self.mem_pool_device.kv_buffer,
             self._mla_bt,
@@ -1260,6 +1262,8 @@ class HiCacheController:
                 if page_size > 1
                 else indices
             )
+            if page_idx.is_cuda:
+                page_idx.record_stream(self.load_stream)
             self._bcast_buf(
                 self._mla_idx_bufs, self._mla_idx_bt, page_idx, self._mla_idx_elem
             )
