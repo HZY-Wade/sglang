@@ -751,30 +751,37 @@ class HiCacheController:
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
 
-        # Reject backends that cannot tolerate a dummy host pool.
+        # Reject backends that cannot coexist with the active MLA/NSA
+        # host-memory dedup broadcast.
         #
         # When startup --hicache-storage-backend was unset (or "file"),
-        # storage_supports_host_dedup(...) was True, so non-rank-0 MLA/NSA
-        # attn-TP ranks were built with allocator-only dummy host pools
-        # (kv_buffer is None). The RDMA/registered backends — mooncake / eic /
-        # simm / hf3fs / nixl / aibrix — pin or register that buffer at
-        # construct or register time and would dereference None. We have no
-        # safe way to rebuild full host pools across all ranks at runtime
-        # (allocating hundreds of GB would itself re-introduce the watchdog
-        # race this commit's earlier prebuild was meant to head off), so the
-        # only correct behavior is to refuse. Restart with the desired
-        # backend on the CLI if you need one of these.
-        if getattr(
-            self.mem_pool_host, "_is_dummy", False
-        ) and not storage_supports_host_dedup(storage_backend):
+        # storage_supports_host_dedup(...) was True, so this controller
+        # entered dedup mode on every attn-TP rank: rank 0 owns the host
+        # copy and broadcasts loaded GPU pages to non-rank-0 ranks that
+        # hold allocator-only dummy host pools (kv_buffer is None). The
+        # RDMA/registered backends -- mooncake / eic / simm / hf3fs / nixl
+        # / aibrix -- pin or register that buffer at construct or register
+        # time and would dereference None on the dummy ranks.
+        #
+        # Reject on EVERY dedup participant (self.mla_broadcast_enabled is
+        # True on rank 0 too because it is the broadcast source). Gating
+        # on self.mem_pool_host._is_dummy alone would be rank-asymmetric:
+        # rank 0's full pool would silently accept the attach while peers
+        # raise, and because attach_storage_backend is fanned out via the
+        # tokenizer with no rollback on partial failure, the server would
+        # be left in a half-attached state.
+        if self.mla_broadcast_enabled and not storage_supports_host_dedup(
+            storage_backend
+        ):
             raise RuntimeError(
                 f"Cannot runtime-attach non-dedup-compatible storage backend "
-                f"{storage_backend!r} to a dummy MLA/NSA host pool: this rank "
-                f"was started without storage (or with a dedup-compatible "
-                f"backend), so its host KV buffer is None. Only None/''/'file' "
-                f"backends can attach later on a dummy pool. Restart the "
-                f"server with --hicache-storage-backend={storage_backend} to "
-                f"use this backend."
+                f"{storage_backend!r} while MLA/NSA host-memory dedup is "
+                f"active: non-rank-0 attn-TP ranks hold dummy host pools "
+                f"(kv_buffer=None) and this backend would dereference them. "
+                f"Only None/''/'file' backends can attach later in dedup "
+                f"mode. Restart the server with "
+                f"--hicache-storage-backend={storage_backend} to use this "
+                f"backend (every rank will then keep a full host pool)."
             )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
